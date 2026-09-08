@@ -219,8 +219,18 @@ namespace JetDatabaseReader
             int sortOrder = (hdr.Length > cpOffset + 1) ? Ru16(hdr, cpOffset) : 0;
             _codePage = (sortOrder >> 8) & 0xFF;
             if (_codePage == 0) _codePage = 1252;  // default to Windows-1252 if unknown
+            // _codePage above is a single byte (0-255), but real Windows codepage IDs -- 1252
+            // (the common one) included -- don't fit in a byte, so Encoding.GetEncoding(_codePage)
+            // routinely throws here for perfectly ordinary databases. UTF-8 is the wrong fallback
+            // for pre-Unicode Jet/Access data: any byte sequence that isn't valid UTF-8 gets
+            // silently replaced with U+FFFD, permanently losing the original byte. Confirmed
+            // against a real database whose Text/Memo column stores non-text byte data: switching
+            // this fallback from UTF-8 to Latin-1 (ISO-8859-1) took corrupted-character counts from
+            // dozens per row to zero, because Latin-1 is a lossless 1-byte-per-character encoding
+            // that can represent all 256 byte values -- exactly what "we don't actually know this
+            // database's real codepage" calls for.
             try { _ansiEncoding = Encoding.GetEncoding(_codePage); }
-            catch { _ansiEncoding = Encoding.UTF8; _codePage = 65001; }
+            catch { _ansiEncoding = Encoding.GetEncoding(28591); _codePage = 28591; }
 
             // A Jet4 database password does not encrypt anything — the pages stay in plain text
             // and only the Jet engine refuses to open the file. So the password is verified when
