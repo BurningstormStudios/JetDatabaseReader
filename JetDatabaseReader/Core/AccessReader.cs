@@ -219,18 +219,28 @@ namespace JetDatabaseReader
             int sortOrder = (hdr.Length > cpOffset + 1) ? Ru16(hdr, cpOffset) : 0;
             _codePage = (sortOrder >> 8) & 0xFF;
             if (_codePage == 0) _codePage = 1252;  // default to Windows-1252 if unknown
-            // _codePage above is a single byte (0-255), but real Windows codepage IDs -- 1252
-            // (the common one) included -- don't fit in a byte, so Encoding.GetEncoding(_codePage)
-            // routinely throws here for perfectly ordinary databases. UTF-8 is the wrong fallback
-            // for pre-Unicode Jet/Access data: any byte sequence that isn't valid UTF-8 gets
-            // silently replaced with U+FFFD, permanently losing the original byte. Confirmed
-            // against a real database whose Text/Memo column stores non-text byte data: switching
-            // this fallback from UTF-8 to Latin-1 (ISO-8859-1) took corrupted-character counts from
-            // dozens per row to zero, because Latin-1 is a lossless 1-byte-per-character encoding
-            // that can represent all 256 byte values -- exactly what "we don't actually know this
-            // database's real codepage" calls for.
+            // The byte pulled out of `sortOrder` above is a JET-internal sort-order id, not a
+            // Windows code page number -- real code page ids (1252 included) are 3-5 digits and
+            // can never round-trip through an 8-bit mask, so treating that byte as if it were
+            // itself a code page id for Encoding.GetEncoding() is simply the wrong lookup: it
+            // "succeeds" only by coincidence, and throws for perfectly ordinary databases (e.g. a
+            // real DAO 3.6 en-US Jet 3.0 database: sortOrder=51181 -> masked byte 199, not a
+            // registered code page at all).
+            //
+            // Confirmed against that exact database (its Text/Memo columns hold raw 0-255 byte
+            // data, verified byte-for-byte against the real DAO/Jet engine): the overwhelmingly
+            // common real-world case is an English-locale database whose true code page is 1252,
+            // so that's the fallback to try first. Only if 1252 itself is somehow unavailable do
+            // we drop to Latin-1 (ISO-8859-1) as a last resort -- it's a lossless 1-byte-per-
+            // character encoding that can represent all 256 byte values, so at worst this loses
+            // 1252's specific mapping for 0x80-0x9F without ever discarding a byte outright (unlike
+            // UTF-8, which would silently replace any non-UTF-8 byte sequence with U+FFFD).
             try { _ansiEncoding = Encoding.GetEncoding(_codePage); }
-            catch { _ansiEncoding = Encoding.GetEncoding(28591); _codePage = 28591; }
+            catch
+            {
+                try { _ansiEncoding = Encoding.GetEncoding(1252); _codePage = 1252; }
+                catch { _ansiEncoding = Encoding.GetEncoding(28591); _codePage = 28591; }
+            }
 
             // A Jet4 database password does not encrypt anything — the pages stay in plain text
             // and only the Jet engine refuses to open the file. So the password is verified when
