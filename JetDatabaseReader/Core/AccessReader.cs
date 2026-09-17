@@ -2126,6 +2126,74 @@ namespace JetDatabaseReader
         /// <summary>
         /// Reads the entire table into a DataTable with properly typed columns.
         /// Each column uses its native CLR type (int, DateTime, decimal, etc.).
+        /// <summary>
+        /// Reports how a table's rows are laid out: each column's descriptor, and the header of
+        /// the first few rows.
+        /// </summary>
+        /// <remarks>
+        /// For the case where values come back as plausible-looking rubbish. A row carries its own
+        /// column count, and a table that has been ALTERed over its life holds rows written
+        /// against several different schemas at once — so a descriptor can be perfectly correct
+        /// and still not describe the row being read through it. None of that is visible from the
+        /// values, which is why it is printable here.
+        /// </remarks>
+        public string DescribeRowLayout(string tableName, int maxRows = 3)
+        {
+            ThrowIfDisposed();
+            Guard.NotNullOrEmpty(tableName, nameof(tableName));
+
+            CatalogEntry entry = GetCatalogEntry(tableName);
+            if (entry == null) return $"No table named '{tableName}'.";
+
+            TableDef td = ReadTableDef(entry.TDefPage);
+            if (td == null) return $"Could not read the definition of '{tableName}'.";
+
+            var report = new StringBuilder();
+            report.AppendLine($"{tableName}: {td.Columns.Count} columns, num_rows={td.RowCount}, " +
+                              $"deletedColumnGaps={td.HasDeletedColumns}, hasVariableColumns={td.HasVariableColumns}");
+
+            report.AppendLine("  colNum  varIdx  fixedOff  fixed  type  size  name");
+            foreach (ColumnInfo c in td.Columns)
+            {
+                report.AppendLine($"  {c.ColNum,6}  {c.VarIdx,6}  {c.FixedOff,8}  {(c.IsFixed ? "Y" : "n"),5}  " +
+                                  $"{c.Type,4}  {c.Size,4}  {c.Name}");
+            }
+
+            RowShape shape = BuildShape(td, null);
+            var scanner = new RowScanner();
+            byte[] scan = NewScanBuffer();
+            int seen = 0;
+
+            foreach (long p in EnumerateTablePages(entry.TDefPage))
+            {
+                if (seen >= maxRows) break;
+
+                byte[] page = ReadPageForScan(p, scan);
+                if (page[0] != 0x01) continue;
+                if ((long)Ri32(page, _dpTDefOff) != entry.TDefPage) continue;
+
+                foreach (RowSpan span in EnumerateRowSpans(page, scanner))
+                {
+                    if (seen >= maxRows) break;
+
+                    int numCols = _jet4 ? Ru16(span.Page, span.Start) : span.Page[span.Start];
+                    int nullMaskSz = (numCols + 7) / 8;
+                    int varLen = -1;
+
+                    if (td.HasVariableColumns && span.Size > nullMaskSz + _varLenFldSz)
+                    {
+                        int varLenPos = span.Size - nullMaskSz - _varLenFldSz;
+                        varLen = _jet4 ? Ru16(span.Page, span.Start + varLenPos) : span.Page[span.Start + varLenPos];
+                    }
+
+                    report.AppendLine($"  row {seen}: rowSize={span.Size} num_cols={numCols} varLen={varLen}");
+                    seen++;
+                }
+            }
+
+            return report.ToString();
+        }
+
         /// This is the recommended method for reading table data.
         /// </summary>
         /// <param name="tableName">Table name (case-insensitive). If null or empty, reads the first table.</param>
@@ -2546,6 +2614,51 @@ namespace JetDatabaseReader
         /// straight from the row bytes instead of formatting a string and re-parsing it.
         /// Returns false when the row is malformed and should be skipped.
         /// </summary>
+
+        /// <summary>
+        /// The row offset of every variable-length column in a Jet3 row, with the jump table
+        /// applied.
+        /// </summary>
+        /// <remarks>
+        /// A Jet3 var_table entry is a single byte and cannot address past 255. Rows longer than
+        /// that carry a jump table whose entries name the variable column at which the offsets
+        /// cross into the next 256-byte block, so the real offset is the byte plus 256 for every
+        /// jump passed.
+        ///
+        /// Skipping this does not fail, which is what makes it worth a test: the offsets simply
+        /// come out 256 or 512 bytes low, land in the row's fixed area, and yield values that
+        /// look like data. Only tables wide enough to push a row past 255 bytes are affected,
+        /// so a database can read perfectly except for its widest table.
+        ///
+        /// Returns null when the table is malformed, leaving the caller to fall back.
+        /// </remarks>
+        internal static int[] DecodeJet3VarOffsets(byte[] page, int rowStart, int rowSize,
+                                                   int varLen, int varTableStart, int varLenPos, int jumpSz)
+        {
+            var offsets = new int[varLen + 1];
+            int jumpsUsed = 0;
+
+            // The var_table is in reverse column order and the end-of-data offset is its final
+            // entry, so one descending walk covers the columns and EOD together.
+            for (int v = 0; v <= varLen; v++)
+            {
+                while (jumpsUsed < jumpSz)
+                {
+                    int jumpPos = rowStart + varLenPos - 1 - jumpsUsed;
+                    if (jumpPos < rowStart || jumpPos >= rowStart + rowSize) return null;
+                    if (page[jumpPos] != v) break;
+                    jumpsUsed++;
+                }
+
+                int entry = varTableStart + varLen - 1 - v;
+                if (entry < 0 || entry >= rowSize) return null;
+
+                offsets[v] = page[rowStart + entry] + jumpsUsed * 256;
+            }
+
+            return offsets;
+        }
+
         private bool CrackRow(byte[] page, int rowStart, int rowSize, RowShape shape,
                               string[] stringOut, object[] typedOut)
         {
@@ -2582,6 +2695,7 @@ namespace JetDatabaseReader
             // discount of 0 parsed, and all 838 rows with a real discount were dropped without a
             // word, 39% of the table.
             int varLen = 0, varTableStart = 0, eod = 0;
+            int[] varOffsets = null;
 
             if (shape.Table.HasVariableColumns)
             {
@@ -2598,6 +2712,21 @@ namespace JetDatabaseReader
                 if (eodPos < _numColsFldSz) return false;
 
                 eod = _jet4 ? Ru16(page, rowStart + eodPos) : page[rowStart + eodPos];
+
+                // A Jet3 var_table entry is ONE byte, so it cannot address past 255 on its own.
+                // Rows longer than that carry a jump table: each entry names the variable column
+                // at which the offsets cross into the next 256-byte block. Without applying it,
+                // every variable column in a long row is read 256 (or 512, ...) bytes too low --
+                // which lands in the fixed area and yields plausible-looking rubbish rather than
+                // an error. Short rows have an empty jump table and are unaffected, so this only
+                // ever showed up on wide tables.
+                if (jumpSz > 0)
+                {
+                    varOffsets = DecodeJet3VarOffsets(page, rowStart, rowSize, varLen, varTableStart, varLenPos, jumpSz);
+
+                    if (varOffsets != null)
+                        eod = varOffsets[varLen];
+                }
             }
 
             // ── Decode each selected column ───────────────────────────────
@@ -2663,13 +2792,19 @@ namespace JetDatabaseReader
                     if (col.VarIdx < varLen)
                     {
                         int entryPos = varTableStart + (varLen - 1 - col.VarIdx) * _varEntrySz;  // relative
-                        if (entryPos >= 0 && entryPos + _varEntrySz <= rowSize)
+                        if (varOffsets != null || (entryPos >= 0 && entryPos + _varEntrySz <= rowSize))
                         {
-                            int varOff = _jet4 ? Ru16(page, rowStart + entryPos) : page[rowStart + entryPos];
+                            int varOff = varOffsets != null
+                                ? varOffsets[col.VarIdx]
+                                : (_jet4 ? Ru16(page, rowStart + entryPos) : page[rowStart + entryPos]);
 
                             // End of this variable column's data
                             int varEnd;
-                            if (col.VarIdx + 1 < varLen)
+                            if (varOffsets != null)
+                            {
+                                varEnd = varOffsets[col.VarIdx + 1];
+                            }
+                            else if (col.VarIdx + 1 < varLen)
                             {
                                 int nextEntry = varTableStart + (varLen - 2 - col.VarIdx) * _varEntrySz;  // relative
                                 varEnd = (_jet4 ? Ru16(page, rowStart + nextEntry) : page[rowStart + nextEntry]);
