@@ -37,6 +37,31 @@ namespace JetDatabaseReader
         public bool ValidateOnOpen { get; set; } = true;
 
         /// <summary>
+        /// When true, Text and Memo columns are decoded so that every byte value round-trips:
+        /// byte n always becomes the character U+00nn. Default: false, which decodes through the
+        /// database's ANSI code page as before.
+        ///
+        /// For a database that really does hold text, leave this alone — the ANSI code page is
+        /// what the data was written with, and it is what renders a name correctly.
+        ///
+        /// Set it when an application has stored *binary* in Text or Memo columns, which was
+        /// ordinary practice in VB6 and Access-era software: a value written with Chr$(n) and
+        /// read back with Asc() is a byte array, not a string. Windows-1252 cannot carry one
+        /// intact — 27 of its 256 byte values decode to a different code point (0x80 becomes the
+        /// euro sign, 0x92 a curly quote), so those bytes come back as something else and
+        /// nothing reports an error, because the result is still a perfectly valid string.
+        ///
+        /// This changes only which encoding is used for Text and Memo. It does not change how any
+        /// column is located, sized or read.
+        ///
+        /// In practice it reaches Jet3 and little else: Jet4 and ACE store Text and Memo as
+        /// UCS-2, which is read through <see cref="System.Text.Encoding.Unicode"/> and never
+        /// touches the ANSI decode this replaces. A Jet4 column holding real curly quotes reads
+        /// the same either way, as it should.
+        /// </summary>
+        public bool PreserveTextBytes { get; set; }
+
+        /// <summary>
         /// How OLE Object columns are rendered. Default: <see cref="OleObjectMode.DataUri"/>.
         /// Set to <see cref="OleObjectMode.Placeholder"/> when the payloads are not needed —
         /// it skips both the base64 encoding and the LVAL page reads behind it.

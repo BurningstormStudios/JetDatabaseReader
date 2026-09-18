@@ -235,11 +235,25 @@ namespace JetDatabaseReader
             // character encoding that can represent all 256 byte values, so at worst this loses
             // 1252's specific mapping for 0x80-0x9F without ever discarding a byte outright (unlike
             // UTF-8, which would silently replace any non-UTF-8 byte sequence with U+FFFD).
-            try { _ansiEncoding = Encoding.GetEncoding(_codePage); }
-            catch
+            // Opt-in: the caller has told us these columns hold binary rather than text, so the
+            // only correct decode is the one that preserves every byte. ISO-8859-1 maps byte n
+            // to U+00nn for all 256 values, which no ANSI code page does -- see
+            // AccessReaderOptions.PreserveTextBytes. Chosen before the code page lookup because
+            // the file's declared page is irrelevant once the caller has said the content is not
+            // text.
+            if (options.PreserveTextBytes)
             {
-                try { _ansiEncoding = Encoding.GetEncoding(1252); _codePage = 1252; }
-                catch { _ansiEncoding = Encoding.GetEncoding(28591); _codePage = 28591; }
+                _ansiEncoding = Encoding.GetEncoding(28591);
+                _codePage = 28591;
+            }
+            else
+            {
+                try { _ansiEncoding = Encoding.GetEncoding(_codePage); }
+                catch
+                {
+                    try { _ansiEncoding = Encoding.GetEncoding(1252); _codePage = 1252; }
+                    catch { _ansiEncoding = Encoding.GetEncoding(28591); _codePage = 28591; }
+                }
             }
 
             // A Jet4 database password does not encrypt anything — the pages stay in plain text
